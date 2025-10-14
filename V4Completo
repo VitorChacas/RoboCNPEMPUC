@@ -1,0 +1,437 @@
+#include <ESP8266WiFi.h>
+#include <AccelStepper.h>
+#include <MultiStepper.h>
+#include <Servo.h>
+#include <cmath> // Para usar fabs (valor absoluto float)
+
+// ================== CONFIG GERAL DO ROBÔ ==================
+#define PI 3.14159265358979323846
+// Constante de conversão baseada na sua tabela: ~10,18592 passos/mm
+const float PASSOS_POR_UNIDADE = 10.18592; 
+
+// ================== CONFIG WiFi ==================
+const char* ssid = "ROBO_CNPEM";
+const char* password = "12345678";
+WiFiServer server(80);
+
+// ================== PINOS DO CNC SHIELD ==================
+// Driver X (Vertical - Eixo X)
+#define X_STEP D2
+#define X_DIR  D5
+// Driver Y (Horizontal - Eixo Y)
+#define Y_STEP D3
+#define Y_DIR  D6
+// Driver Z (Horizontal - Eixo Z)
+#define Z_STEP D4
+#define Z_DIR  D7
+// Driver A (Vertical - Eixo A/E)
+#define A_STEP D12
+#define A_DIR  D13
+
+#define EN     D8 // Enable compartilhado
+
+// Servos
+#define SERVO1_PIN D9 
+#define SERVO2_PIN D0 
+
+Servo servo1;
+Servo servo2;
+
+// ================== OBJETOS ==================
+AccelStepper stepperX(AccelStepper::DRIVER, X_STEP, X_DIR);
+AccelStepper stepperA(AccelStepper::DRIVER, A_STEP, A_DIR);
+AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP, Y_DIR);
+AccelStepper stepperZ(AccelStepper::DRIVER, Z_STEP, Z_DIR);
+
+MultiStepper eixoVertical;   
+MultiStepper eixoHorizontal; 
+
+// ================== VARIÁVEIS DE ESTADO ==================
+long posVertical[2] = {0, 0};   // X e A
+long posHorizontal[2] = {0, 0}; // Y e Z
+String statusMessage = "Sistema pronto.";
+
+// Forward declarations
+void sendHTML(WiFiClient client);
+void moverVertical(long passos);
+void moverHorizontal(long passos);
+void moveSingleStepper(AccelStepper &stepper, long steps);
+void fazerCruz();
+void parseAndExecuteCommand(String command);
+
+// ================== FUNÇÕES DE MOVIMENTO GANTRY (para rotinas antigas) ==================
+
+void moverVertical(long passos) {
+  posVertical[0] += passos; // X
+  posVertical[1] += passos; // A
+  digitalWrite(EN, LOW);
+  long targetPos[2] = {posVertical[0], posVertical[1]};
+  eixoVertical.moveTo(targetPos);
+  while(eixoVertical.run()) {
+    yield();
+  }
+  digitalWrite(EN, HIGH);
+}
+
+void moverHorizontal(long passos) {
+  posHorizontal[0] += passos; // Y
+  posHorizontal[1] += passos; // Z
+  digitalWrite(EN, LOW);
+  long targetPos[2] = {posHorizontal[0], posHorizontal[1]};
+  eixoHorizontal.moveTo(targetPos);
+  while(eixoHorizontal.run()) {
+    yield();
+  }
+  digitalWrite(EN, HIGH);
+}
+
+// ================== FUNÇÃO DE MOVIMENTO INDIVIDUAL (para comando manual) ==================
+
+void moveSingleStepper(AccelStepper &stepper, long steps) {
+    digitalWrite(EN, LOW);
+    // Move para a posição absoluta
+    long targetPos = stepper.currentPosition() + steps;
+    stepper.moveTo(targetPos);
+
+    while (stepper.distanceToGo() != 0) {
+        stepper.run();
+        yield(); 
+    }
+    digitalWrite(EN, HIGH);
+}
+
+// ================== ROTINA DE TESTE: CRUZ ==================
+
+void fazerCruz() {
+  statusMessage = "Executando Rotina da Cruz...";
+  
+  // Define o movimento inicial (X+A)
+  moverVertical(6400); 
+  delay(1000); 
+
+  long passosMetade = 700; 
+
+  servo1.write(180); // Lower servo
+  delay(500);
+
+  // Horizontal movements
+  moverHorizontal(passosMetade / 2);
+  delay(1000);
+  moverHorizontal(-passosMetade);
+  delay(1000);
+  moverHorizontal(passosMetade / 2);
+  delay(1000);
+
+  // Vertical movements
+  moverVertical(passosMetade / 2);
+  delay(1000);
+  moverVertical(-passosMetade);
+  delay(1000);
+  moverVertical(passosMetade / 2);
+  delay(1000);
+
+  servo1.write(0); // Raise servo
+  delay(500);
+
+  statusMessage = "Rotina da Cruz Concluída.";
+}
+
+// ================== NOVO EXECUTOR DE COMANDOS DE 10 VARIAVEIS ==================
+
+/**
+ * Executa um comando complexo de 10 variáveis no formato:
+ * c1 (servo1), c2 (servo2), sx, vx, sy, vy, sz, vz, sa, va
+ * Os parâmetros de velocidade (vx, vy, etc.) são usados como MaxSpeed para o segmento.
+ */
+void executeFullCommand(int c1, int c2, long sx, float vx, long sy, float vy, long sz, float vz, long sa, float va) {
+    statusMessage = "Executando comando FULL: C1=" + String(c1) + ", Sy=" + String(sy) + ", Vy=" + String(vy, 2);
+
+    // 1. Controle das Canetas (Servos)
+    servo1.write(c1);
+    servo2.write(c2);
+
+    // 2. Configuração de Velocidades
+    // fabs() garante que a velocidade seja um valor positivo.
+    stepperX.setMaxSpeed(fabs(vx));
+    stepperA.setMaxSpeed(fabs(va));
+    stepperY.setMaxSpeed(fabs(vy));
+    stepperZ.setMaxSpeed(fabs(vz));
+    
+    // 3. Configuração dos Movimentos
+    // O moveTo define o destino absoluto, que é a Posição Atual + os Passos (sx, sy, etc.)
+    long targetX = stepperX.currentPosition() + sx;
+    long targetA = stepperA.currentPosition() + sa;
+    long targetY = stepperY.currentPosition() + sy;
+    long targetZ = stepperZ.currentPosition() + sz;
+    
+    // 4. Execução do Movimento Coordenado
+    digitalWrite(EN, LOW); // Habilita Drivers
+
+    stepperX.moveTo(targetX);
+    stepperY.moveTo(targetY);
+    stepperZ.moveTo(targetZ);
+    stepperA.moveTo(targetA);
+
+    // Loop de execução que coordena 4 motores para que todos cheguem juntos.
+    // O AccelStepper garante o movimento linear e a velocidade.
+    bool running = true;
+    while(running) {
+        // A função run() retorna true se o motor ainda estiver se movendo
+        running = stepperX.run() | stepperY.run() | stepperZ.run() | stepperA.run();
+        yield();
+    }
+    
+    digitalWrite(EN, HIGH); // Desabilita Drivers
+
+    // 5. Atualiza as variáveis de estado globais (para consistência, embora os steppers sejam a fonte da verdade)
+    posVertical[0] = stepperX.currentPosition();
+    posVertical[1] = stepperA.currentPosition();
+    posHorizontal[0] = stepperY.currentPosition();
+    posHorizontal[1] = stepperZ.currentPosition();
+}
+
+
+// ================== PARSER DE COMANDOS (MODIFICADO) ==================
+
+void parseAndExecuteCommand(String command) {
+    command.toUpperCase();
+    
+    // --- NOVO COMANDO COMPLEXO: FULL ---
+    // Formato esperado: FULL:c1,c2,sx,vx,sy,vy,sz,vz,sa,va
+    if (command.startsWith("FULL:")) {
+        // Separa os valores (strings)
+        String data = command.substring(5);
+        
+        float vals[10]; // Usamos float para as velocidades
+        int lastIndex = 0;
+        
+        for (int i = 0; i < 10; i++) {
+            int commaIndex = data.indexOf(',', lastIndex);
+            if (commaIndex == -1) commaIndex = data.length(); 
+
+            String sub = data.substring(lastIndex, commaIndex);
+            vals[i] = sub.toFloat(); 
+            lastIndex = commaIndex + 1;
+            
+            if (i == 9 && commaIndex < data.length()) { 
+                statusMessage = "Erro: Mais de 10 valores no comando FULL.";
+                return;
+            }
+        }
+
+        // Chama a função executora com os valores convertidos
+        executeFullCommand(
+            (int)vals[0],  // c1 (Servo 1) - int
+            (int)vals[1],  // c2 (Servo 2) - int
+            (long)vals[2], // sx (Steps X) - long
+            vals[3],       // vx (Velocidade X) - float
+            (long)vals[4], // sy (Steps Y) - long
+            vals[5],       // vy (Velocidade Y) - float
+            (long)vals[6], // sz (Steps Z) - long
+            vals[7],       // vz (Velocidade Z) - float
+            (long)vals[8], // sa (Steps A) - long
+            vals[9]        // va (Velocidade A) - float
+        );
+        return;
+    }
+    
+    // --- Comandos Simples (Manuais) ---
+    if (command.length() < 2) {
+        statusMessage = "Erro: Comando inválido.";
+        return;
+    }
+
+    char cmdType = command.charAt(0);
+    long cmdValue = command.substring(1).toInt();
+
+    switch (cmdType) {
+        case 'X':
+        case 'Y':
+        case 'Z':
+        case 'E': 
+            // Comando para mover um único motor
+            if (cmdType == 'X') moveSingleStepper(stepperX, cmdValue);
+            else if (cmdType == 'Y') moveSingleStepper(stepperY, cmdValue);
+            else if (cmdType == 'Z') moveSingleStepper(stepperZ, cmdValue);
+            else if (cmdType == 'E') moveSingleStepper(stepperA, cmdValue);
+            statusMessage = "Motor " + String(cmdType) + " movido " + String(cmdValue) + " passos.";
+            break;
+        case 'S': // Servo 1 (c1)
+            if (cmdValue >= 0 && cmdValue <= 180) {
+                servo1.write(cmdValue);
+                statusMessage = "Servo 1 movido para " + String(cmdValue) + "° (c1).";
+            } else {
+                statusMessage = "Erro: Ângulo do servo 1 inválido.";
+            }
+            break;
+        case 'A': // Servo 2 (c2)
+            if (cmdValue >= 0 && cmdValue <= 180) {
+                servo2.write(cmdValue);
+                statusMessage = "Servo 2 movido para " + String(cmdValue) + "° (c2).";
+            } else {
+                statusMessage = "Erro: Ângulo do servo 2 inválido.";
+            }
+            break;
+        default:
+            statusMessage = "Erro: Comando '" + String(cmdType) + "' desconhecido.";
+            break;
+    }
+}
+
+// ================== CONFIG GERAL ==================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(EN, OUTPUT);
+  digitalWrite(EN, HIGH); 
+
+  // Configuração inicial dos motores (pode ser substituída pelos comandos FULL)
+  stepperX.setMaxSpeed(1600);
+  stepperX.setAcceleration(800);
+  stepperA.setMaxSpeed(1600);
+  stepperA.setAcceleration(800);
+  stepperY.setMaxSpeed(1600);
+  stepperY.setAcceleration(800);
+  stepperZ.setMaxSpeed(1600);
+  stepperZ.setAcceleration(800);
+  
+  // Set motor directions (mantidas)
+  stepperX.setPinsInverted(false, false, false);
+  stepperA.setPinsInverted(true,  false, false);
+  stepperY.setPinsInverted(false, false, false);
+  stepperZ.setPinsInverted(true,  false, false);
+
+  // Group motors (mantidas para as rotinas antigas, mas não usadas pelo FULL)
+  eixoVertical.addStepper(stepperX);
+  eixoVertical.addStepper(stepperA);
+  eixoHorizontal.addStepper(stepperY);
+  eixoHorizontal.addStepper(stepperZ);
+
+  // Configure and attach servos
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(0); 
+  servo2.write(0); 
+
+  // Start WiFi Access Point
+  WiFi.softAP(ssid, password);
+  Serial.print("Rede WiFi criada: ");
+  Serial.println(ssid);
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Start web server
+  server.begin();
+}
+
+// ================== LOOP PRINCIPAL ==================
+
+void loop() {
+  WiFiClient client = server.available();
+  if (!client) {
+    return;
+  }
+
+  String request = client.readStringUntil('\r');
+  client.flush();
+
+  bool actionTaken = false;
+  String command = "";
+
+  // --- Processar Ações ---
+  if (request.indexOf("GET /?comando=") >= 0) {
+    int cmdPos = request.indexOf('=');
+    int endPos = request.indexOf(' ', cmdPos);
+    command = request.substring(cmdPos + 1, endPos);
+    command.trim();
+    if (command.length() > 0) {
+      // Decode URL-encoded characters (like comma) if necessary
+      // For this simplified example, we rely on the external tool sending clean data
+      parseAndExecuteCommand(command);
+    }
+    actionTaken = true;
+  } else if (request.indexOf("/fazer_cruz") != -1) {
+    fazerCruz(); 
+    actionTaken = true;
+  }
+  // Os comandos /servo_on/off podem ser removidos, pois agora são cobertos pelo S[angulo] e A[angulo]
+  // Mas vamos mantê-los por compatibilidade, usando o parser (S180 ou A180)
+  else if (request.indexOf("/servo1_on") != -1) { parseAndExecuteCommand("S180"); actionTaken = true; } 
+  else if (request.indexOf("/servo1_off") != -1) { parseAndExecuteCommand("S0"); actionTaken = true; } 
+  else if (request.indexOf("/servo2_on") != -1) { parseAndExecuteCommand("A180"); actionTaken = true; } 
+  else if (request.indexOf("/servo2_off") != -1) { parseAndExecuteCommand("A0"); actionTaken = true; } 
+
+
+  // --- Enviar Resposta ---
+  if (actionTaken) {
+    client.println("HTTP/1.1 302 Found");
+    client.println("Location: /");
+    client.println();
+  } else {
+    sendHTML(client);
+  }
+
+  delay(1);
+  client.stop();
+}
+
+// ================== GERADOR DE PÁGINA HTML ==================
+
+void sendHTML(WiFiClient client) {
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println("<!DOCTYPE HTML><html><head>");
+  client.println("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  client.println("<title>Controle de Motores</title>");
+  client.println("<style>");
+  client.println("body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; }");
+  client.println("h1 { text-align: center; color: #333; }");
+  client.println(".container { max-width: 1200px; margin: auto; }");
+  client.println(".status-bar { background-color: #e7f3fe; border-left: 6px solid #2196F3; padding: 15px; margin-bottom: 20px; }");
+  client.println(".main-content { display: flex; flex-wrap: wrap; gap: 20px; }");
+  client.println(".card { background-color: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 20px; flex: 1; min-width: 280px; }");
+  client.println("h2 { color: #2196F3; margin-top: 0; border-bottom: 1px solid #eee; padding-bottom: 10px; }");
+  client.println("table { width: 100%; border-collapse: collapse; }");
+  client.println("th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }");
+  client.println("th { background-color: #f8f8f8; }");
+  client.println("input[type='text'] { width: calc(100% - 22px); padding: 10px; border: 1px solid #ccc; border-radius: 4px; }");
+  client.println("button, .btn { background-color: #2196F3; color: white; border: none; padding: 12px 20px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; border-radius: 5px; cursor: pointer; width: 100%; margin-top: 10px; }");
+  client.println("button:hover, .btn:hover { background-color: #0b7dda; }");
+  client.println(".btn-secondary { background-color: #6c757d; } .btn-secondary:hover { background-color: #5a6268; }");
+  client.println(".btn-danger { background-color: #d9534f; } .btn-danger:hover { background-color: #c9302c; }");
+  client.println(".servo-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }");
+  client.println(".footer-card { text-align: center; }");
+  client.println("</style></head><body>");
+  client.println("<div class='container'>");
+  client.println("<h1>Controle de Motores via Wi-Fi</h1>");
+  client.println("<div class='status-bar'><b>Status:</b> " + statusMessage + "</div>");
+  client.println("<div class='main-content'>");
+  // Card: Menu de Comandos
+  client.println("<div class='card'><h2>Menu de Comandos</h2><table>");
+  client.println("<tr><th>Comando</th><th>Descrição</th></tr>");
+  client.println("<tr><td>X[passos]</td><td>Move o motor X. Ex: X1600</td></tr>");
+  client.println("<tr><td>S[angulo]</td><td>Move Servo 1 (c1). Ex: S90</td></tr>");
+  client.println("<tr><td>A[angulo]</td><td>Move Servo 2 (c2). Ex: A180</td></tr>");
+  client.println("<tr><td colspan='2'>**FULL:c1,c2,sx,vx,sy,vy,sz,vz,sa,va**</td></tr>");
+  client.println("<tr><td colspan='2' style='font-size: small; color: #888;'> Comando de 10 variáveis para execução coordenada.</td></tr>");
+  client.println("</table></div>");
+  // Card: Comando Manual
+  client.println("<div class='card'><h2>Comando Manual</h2>");
+  client.println("<form action='/' method='GET'><input type='text' name='comando' placeholder='Ex: FULL:180,0,100,200,50,400,0,0,0,0' required>");
+  client.println("<button type='submit'>Enviar Comando</button></form></div>");
+  // Card: Controle dos Servos
+  client.println("<div class='card'><h2>Controle dos Servos</h2>");
+  client.println("<div class='servo-controls'>");
+  client.println("<a class='btn' href='/servo1_on'>Ativar Servo 1 (c1=180)</a>");
+  client.println("<a class='btn btn-secondary' href='/servo1_off'>Repouso Servo 1 (c1=0)</a>");
+  client.println("<a class='btn' href='/servo2_on'>Ativar Servo 2 (c2=180)</a>");
+  client.println("<a class='btn btn-secondary' href='/servo2_off'>Repouso Servo 2 (c2=0)</a>");
+  client.println("</div></div></div>");
+  // Card: Rotinas de Teste
+  client.println("<div class='card footer-card' style='margin-top: 20px;'><h2>Rotinas de Teste</h2>");
+  client.println("<a class='btn btn-danger' href='/fazer_cruz'>Executar Rotina da Cruz</a></div>");
+  client.println("</div></body></html>");
+}
