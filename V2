@@ -1,0 +1,195 @@
+#include <AccelStepper.h>
+#include <MultiStepper.h>
+#include <ESP8266WiFi.h>
+#include <Servo.h>  // Biblioteca do servo
+
+// ================== CONFIG WiFi ==================
+const char* ssid = "ROBO_AP";
+const char* password = "12345678";
+
+WiFiServer server(80);
+
+// ================== PINOS DO CNC SHIELD ==================
+// Driver X
+#define X_STEP D2
+#define X_DIR  D5
+// Driver Y
+#define Y_STEP D3
+#define Y_DIR  D6
+// Driver Z
+#define Z_STEP D4
+#define Z_DIR  D7
+// Driver A
+#define A_STEP D12
+#define A_DIR  D13
+
+#define EN     D8   // Enable compartilhado
+
+// Servo
+#define SERVO_PIN D9
+Servo servoBlue;  // objeto para o servo
+
+// ================== OBJETOS ==================
+AccelStepper stepperX(AccelStepper::DRIVER, X_STEP, X_DIR);
+AccelStepper stepperA(AccelStepper::DRIVER, A_STEP, A_DIR);
+AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP, Y_DIR);
+AccelStepper stepperZ(AccelStepper::DRIVER, Z_STEP, Z_DIR);
+
+MultiStepper eixoVertical;    // A + X
+MultiStepper eixoHorizontal;  // Y + Z
+
+// ================== VARIÁVEIS DE POSIÇÃO ==================
+long posVertical[2] = {0, 0};     // X e A
+long posHorizontal[2] = {0, 0};   // Y e Z
+
+// ================== CONFIG GERAL ==================
+void setup() {
+  Serial.begin(115200);
+
+  // Configura Enable
+  pinMode(EN, OUTPUT);
+  digitalWrite(EN, HIGH); // começa desabilitado
+
+  // Configuração dos motores - VELOCIDADE MAIS LENTA PARA NÃO PATINAR
+  stepperX.setMaxSpeed(300);
+  stepperX.setAcceleration(100);
+  
+  stepperA.setMaxSpeed(300);
+  stepperA.setAcceleration(100);
+  
+  stepperY.setMaxSpeed(300);
+  stepperY.setAcceleration(100);
+  
+  stepperZ.setMaxSpeed(300);
+  stepperZ.setAcceleration(100);
+
+  // Configura direção correta de cada motor
+  stepperX.setPinsInverted(false, false, false); 
+  stepperA.setPinsInverted(true,  false, false); 
+  stepperY.setPinsInverted(false, false, false); 
+  stepperZ.setPinsInverted(true,  false, false); 
+
+  // Agrupa motores nos eixos
+  eixoVertical.addStepper(stepperX);
+  eixoVertical.addStepper(stepperA);
+  eixoHorizontal.addStepper(stepperY);
+  eixoHorizontal.addStepper(stepperZ);
+
+  // Cria rede WiFi
+  WiFi.softAP(ssid, password);
+  Serial.print("Rede WiFi criada: ");
+  Serial.println(ssid);
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.begin();
+
+  // Configura servo
+  servoBlue.attach(SERVO_PIN);
+  servoBlue.write(90); // posição inicial "levantado"
+}
+
+// ================== FUNÇÕES DE MOVIMENTO ==================
+void moverVertical(long passos) {
+  posVertical[0] += passos; // X
+  posVertical[1] += passos; // A
+  digitalWrite(EN, LOW);  
+  Serial.print("Movendo vertical para X:");
+  Serial.print(posVertical[0]);
+  Serial.print(" A:");
+  Serial.println(posVertical[1]);
+  eixoVertical.moveTo(posVertical);
+  while(eixoVertical.run()) {}
+  digitalWrite(EN, HIGH); 
+}
+
+void moverHorizontal(long passos) {
+  posHorizontal[0] += passos; // Y
+  posHorizontal[1] += passos; // Z
+  digitalWrite(EN, LOW);  
+  Serial.print("Movendo horizontal para Y:");
+  Serial.print(posHorizontal[0]);
+  Serial.print(" Z:");
+  Serial.println(posHorizontal[1]);
+  eixoHorizontal.moveTo(posHorizontal);
+  while(eixoHorizontal.run()) {}
+  digitalWrite(EN, HIGH); 
+}
+
+// ================== FUNÇÃO CRUZ 1 CM ==================
+void fazerCruz() {
+  long passosMetade = 114; // 0,5 cm = 5 mm em passos
+
+  Serial.println("Iniciando cruz de 1 cm...");
+
+  // Abaixa o servo
+  servoBlue.write(180); // abaixa o servo
+  delay(500);
+
+  // --- Movimentos horizontais ---
+  moverHorizontal(passosMetade);    // direita
+  delay(200);
+  moverHorizontal(-passosMetade);   // volta ao centro
+  delay(200);
+  
+  moverHorizontal(-passosMetade);   // esquerda
+  delay(200);
+  moverHorizontal(passosMetade);    // volta ao centro
+  delay(200);
+
+  // --- Movimentos verticais ---
+  moverVertical(passosMetade);      // cima
+  delay(200);
+  moverVertical(-passosMetade);     // volta ao centro
+  delay(200);
+  
+  moverVertical(-passosMetade);     // baixo
+  delay(200);
+  moverVertical(passosMetade);      // volta ao centro
+  delay(200);
+
+  // Levanta o servo depois de finalizar
+  servoBlue.write(0);
+  delay(500);
+
+  Serial.println("Cruz de 1 cm concluída!");
+}
+
+// ================== LOOP PRINCIPAL ==================
+void loop() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  Serial.println("Novo cliente conectado");
+  String request = client.readStringUntil('\r');
+  client.flush();
+
+  // Comandos recebidos via URL
+  if (request.indexOf("/up") != -1) {
+    moverVertical(200); 
+  } else if (request.indexOf("/down") != -1) {
+    moverVertical(-200); 
+  } else if (request.indexOf("/right") != -1) {
+    moverHorizontal(200); 
+  } else if (request.indexOf("/left") != -1) {
+    moverHorizontal(-200); 
+  } else if (request.indexOf("/cruz") != -1) {
+    fazerCruz(); 
+  }
+
+  // Página HTML estilo joystick
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println("<!DOCTYPE HTML><html>");
+  client.println("<h2 style='text-align:center;'>Controle do Robô</h2>");
+  client.println("<div style='text-align:center;'>");
+  client.println("<a href=\"/up\"><button style='width:80px;height:80px;'>↑</button></a><br>");
+  client.println("<a href=\"/left\"><button style='width:80px;height:80px;'>←</button></a>");
+  client.println("<a href=\"/right\"><button style='width:80px;height:80px;'>→</button></a><br>");
+  client.println("<a href=\"/down\"><button style='width:80px;height:80px;'>↓</button></a><br><br>");
+  client.println("<a href=\"/cruz\"><button style='width:120px;height:80px;background:red;color:white;'>Cruz 1cm</button></a>");
+  client.println("</div>");
+  client.println("</html>");
+}
