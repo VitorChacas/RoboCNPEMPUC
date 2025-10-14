@@ -1,0 +1,91 @@
+#define X_STEP D2
+#define X_DIR  D5
+#define Y_STEP D3
+#define Y_DIR  D6
+#define EN     D8
+
+#define PASSO_MM 0.01865  // mm por passo
+#define MICRO_DELAY 50
+
+long acumuladoX = 0;
+long acumuladoY = 0;
+
+long homeX = 0;
+long homeY = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(X_STEP, OUTPUT);
+  pinMode(X_DIR, OUTPUT);
+  pinMode(Y_STEP, OUTPUT);
+  pinMode(Y_DIR, OUTPUT);
+  pinMode(EN, OUTPUT);
+
+  digitalWrite(EN, LOW);      
+  digitalWrite(X_DIR, HIGH);  
+  digitalWrite(Y_DIR, HIGH);
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input == "s") { // salvar home
+      homeX = acumuladoX;
+      homeY = acumuladoY;
+      Serial.println("Home salvo (0,0)!");
+    } else if (input == "h") { // voltar home
+      moverParaHome();
+    } else if (input == "E") { // mostrar posição
+      Serial.print("X: "); Serial.print((acumuladoX - homeX) * PASSO_MM);
+      Serial.print(" mm, Y: "); Serial.println((acumuladoY - homeY) * PASSO_MM);
+    } else if (input.indexOf(',') > 0) { // coordenadas X,Y
+      int sep = input.indexOf(',');
+      float x_mm = input.substring(0, sep).toFloat();
+      float y_mm = input.substring(sep + 1).toFloat();
+      moverParaXY(x_mm, y_mm);
+    } else if (input == "Q") { // quadrado 60cm x 60cm
+      float tamanho = 600.0; // 60 cm em mm
+      float startX = (acumuladoX - homeX) * PASSO_MM;
+      float startY = (acumuladoY - homeY) * PASSO_MM;
+
+      moverParaXY(startX + tamanho, startY);
+      moverParaXY(startX + tamanho, startY + tamanho);
+      moverParaXY(startX, startY + tamanho);
+      moverParaXY(startX, startY);
+      
+      Serial.println("Quadrado concluído!");
+    }
+  }
+}
+
+void moverPassos(int pinoStep, int dirPin, long passos, bool paraFrente, long *acum) {
+  digitalWrite(dirPin, paraFrente ? HIGH : LOW);
+  for (long i = 0; i < passos; i++) {
+    digitalWrite(pinoStep, HIGH);
+    delayMicroseconds(MICRO_DELAY);
+    digitalWrite(pinoStep, LOW);
+    delayMicroseconds(MICRO_DELAY);
+    *acum += paraFrente ? 1 : -1;
+  }
+}
+
+void moverParaXY(float x_mm, float y_mm) {
+  long alvoX = homeX + round(x_mm / PASSO_MM);
+  long alvoY = homeY + round(y_mm / PASSO_MM);
+
+  long passosX = alvoX - acumuladoX;
+  long passosY = alvoY - acumuladoY;
+
+  moverPassos(X_STEP, X_DIR, abs(passosX), passosX > 0, &acumuladoX);
+  moverPassos(Y_STEP, Y_DIR, abs(passosY), passosY > 0, &acumuladoY);
+
+  Serial.print("Movido para X="); Serial.print(x_mm);
+  Serial.print(" mm, Y="); Serial.println(y_mm);
+}
+
+void moverParaHome() {
+  moverParaXY(0, 0);
+}
