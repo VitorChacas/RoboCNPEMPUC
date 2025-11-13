@@ -1,0 +1,347 @@
+#include <ESP8266WiFi.h>
+#include <AccelStepper.h>
+#include <MultiStepper.h>
+#include <Servo.h>
+#include <WiFiUdp.h>
+
+// ================== CONFIG WiFi ==================
+const char* ssid = "ROBO_CNPEM";
+const char* password = "12345678";
+
+// ================== CONFIG UDP ==================
+WiFiUDP udp;
+unsigned int localUdpPort = 8888;
+char incomingPacket[512];
+
+// ================== PINOS DO CNC SHIELD ==================
+#define X_STEP D2
+#define X_DIR  D5
+#define Y_STEP D3
+#define Y_DIR  D6
+#define Z_STEP D4
+#define Z_DIR  D7
+#define A_STEP D12
+#define A_DIR  D13
+#define EN     D8
+
+#define SERVO1_PIN D9
+#define SERVO2_PIN D0
+
+Servo servo1;
+Servo servo2;
+
+// ================== OBJETOS ==================
+AccelStepper stepperX(AccelStepper::DRIVER, X_STEP, X_DIR);
+AccelStepper stepperA(AccelStepper::DRIVER, A_STEP, A_DIR);
+AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP, Y_DIR);
+AccelStepper stepperZ(AccelStepper::DRIVER, Z_STEP, Z_DIR);
+
+String statusMessage = "Sistema pronto via UDP.";
+
+// ================== DECLARAÇÃO DE FUNÇÕES ==================
+void parseAndExecuteCommand(String command);
+bool parseTabDelimitedCommand(String input, long &Vx, long &Dx, long &Vy, long &Dy, long &Va, long &Da, long &Vz, long &Dz);
+void fazerCruz();
+void sendUDPResponse(String message);
+
+// ================== CONFIG GERAL ==================
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("Iniciando Sistema...");
+  
+  pinMode(EN, OUTPUT);
+  digitalWrite(EN, HIGH);
+
+  // Configuração dos motores
+  stepperX.setMaxSpeed(1600);
+  stepperA.setMaxSpeed(1600);
+  stepperY.setMaxSpeed(1600);
+  stepperZ.setMaxSpeed(1600);
+  
+  stepperX.setAcceleration(1600);
+  stepperA.setAcceleration(1600);
+  stepperY.setAcceleration(1600);
+  stepperZ.setAcceleration(1600);
+
+  stepperX.setPinsInverted(false, false, false);
+  stepperA.setPinsInverted(true,  false, false);
+  stepperY.setPinsInverted(false, false, false);
+  stepperZ.setPinsInverted(true,  false, false);
+
+  // Configuração dos servos
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo1.write(0);
+  servo2.write(0);
+
+  // Configuração WiFi
+  WiFi.softAP(ssid, password);
+  Serial.println("=== CONFIGURAÇÃO WiFi ===");
+  Serial.print("SSID: "); Serial.println(ssid);
+  Serial.print("IP: "); Serial.println(WiFi.softAPIP());
+
+  // Inicia servidor UDP
+  if(udp.begin(localUdpPort)) {
+    Serial.println("UDP Server iniciado na porta " + String(localUdpPort));
+    statusMessage = "UDP OK - Aguardando comandos...";
+  } else {
+    Serial.println("ERRO ao iniciar UDP!");
+    statusMessage = "ERRO UDP!";
+  }
+}
+
+// ================== ROTINA DA CRUZ ==================
+void fazerCruz() {
+  statusMessage = "Executando Rotina da Cruz...";
+  sendUDPResponse(statusMessage);
+  Serial.println(statusMessage);
+
+  long passosMetade = 700;
+
+  servo1.write(180); // Abaixa servo
+  delay(500);
+
+  // Movimentos horizontais - Y e Z JUNTOS
+  moverMotoresSimultaneos(0, 0, passosMetade/2, passosMetade/2, 0, 0, 0, 0);
+  delay(1000);
+  moverMotoresSimultaneos(0, 0, -passosMetade, -passosMetade, 0, 0, 0, 0);
+  delay(1000);
+  moverMotoresSimultaneos(0, 0, passosMetade/2, passosMetade/2, 0, 0, 0, 0);
+  delay(1000);
+
+  // Movimentos verticais - X e A JUNTOS
+  moverMotoresSimultaneos(passosMetade/2, passosMetade/2, 0, 0, 0, 0, 0, 0);
+  delay(1000);
+  moverMotoresSimultaneos(-passosMetade, -passosMetade, 0, 0, 0, 0, 0, 0);
+  delay(1000);
+  moverMotoresSimultaneos(passosMetade/2, passosMetade/2, 0, 0, 0, 0, 0, 0);
+  delay(1000);
+
+  servo1.write(0); // Levanta servo
+  delay(500);
+
+  statusMessage = "Rotina da Cruz Concluída.";
+  sendUDPResponse(statusMessage);
+}
+
+// ================== MOVIMENTO SIMPLES ==================
+void moveSingleStepper(AccelStepper &stepper, long steps) {
+  digitalWrite(EN, LOW);
+  stepper.setCurrentPosition(0);
+  stepper.move(steps);
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+    yield();
+  }
+  digitalWrite(EN, HIGH);
+}
+
+// ================== MOVIMENTO SIMULTÂNEO DOS 4 MOTORES ==================
+void moverMotoresSimultaneos(long Dx, long Da, long Dy, long Dz, long Vx, long Va, long Vy, long Vz) {
+  digitalWrite(EN, LOW);
+  
+  // Configura velocidades se especificadas
+  if (Vx > 0) stepperX.setMaxSpeed(Vx);
+  if (Va > 0) stepperA.setMaxSpeed(Va);
+  if (Vy > 0) stepperY.setMaxSpeed(Vy);
+  if (Vz > 0) stepperZ.setMaxSpeed(Vz);
+  
+  // Move todos os motores para suas posições
+  stepperX.move(Dx);
+  stepperA.move(Da);
+  stepperY.move(Dy);
+  stepperZ.move(Dz);
+  
+  // Executa TODOS os motores simultaneamente
+  while (stepperX.isRunning() || stepperA.isRunning() || stepperY.isRunning() || stepperZ.isRunning()) {
+    stepperX.run();
+    stepperA.run();
+    stepperY.run();
+    stepperZ.run();
+    yield();
+  }
+  
+  digitalWrite(EN, HIGH);
+}
+
+// ================== PARSER PARA FORMATO COM TABULAÇÃO ==================
+bool parseTabDelimitedCommand(String input, long &Vx, long &Dx, long &Vy, long &Dy, long &Va, long &Da, long &Vz, long &Dz) {
+  input.trim();
+  Serial.println("Parsing comando: " + input);
+  
+  input.replace(',', '.');
+  input.replace('\t', ' ');
+  
+  while (input.indexOf("  ") >= 0) {
+    input.replace("  ", " ");
+  }
+  
+  input.trim();
+  
+  float values[8];
+  int count = 0;
+  
+  int lastPos = 0;
+  for (int i = 0; i < input.length() && count < 8; i++) {
+    if (input.charAt(i) == ' ' || i == input.length() - 1) {
+      String token;
+      if (i == input.length() - 1 && input.charAt(i) != ' ') {
+        token = input.substring(lastPos);
+      } else {
+        token = input.substring(lastPos, i);
+      }
+      
+      token.trim();
+      if (token.length() > 0) {
+        values[count++] = token.toFloat();
+      }
+      lastPos = i + 1;
+    }
+  }
+  
+  if (count != 8) {
+    Serial.printf("Erro: esperados 8 valores, recebidos %d\n", count);
+    return false;
+  }
+  
+  Vx = (long)values[0];
+  Dx = (long)values[1];
+  Vy = (long)values[2];
+  Dy = (long)values[3];
+  Va = (long)values[4];
+  Da = (long)values[5];
+  Vz = (long)values[6];
+  Dz = (long)values[7];
+  
+  Serial.printf("Valores: Vx=%ld Dx=%ld Vy=%ld Dy=%ld Va=%ld Da=%ld Vz=%ld Dz=%ld\n", 
+                Vx, Dx, Vy, Dy, Va, Da, Vz, Dz);
+  
+  return true;
+}
+
+// ================== PARSER COMANDO SIMPLES ==================
+void parseAndExecuteCommand(String command) {
+  command.toUpperCase();
+  command.trim();
+  
+  Serial.println("Processando comando: " + command);
+  
+  if (command.length() < 2) {
+    statusMessage = "Erro: Comando inválido.";
+    sendUDPResponse(statusMessage);
+    return;
+  }
+
+  char cmdType = command.charAt(0);
+  long cmdValue = command.substring(1).toInt();
+
+  switch (cmdType) {
+    case 'X':
+      moveSingleStepper(stepperX, cmdValue);
+      statusMessage = "Motor X movido " + String(cmdValue) + " passos.";
+      break;
+    case 'Y':
+      moveSingleStepper(stepperY, cmdValue);
+      statusMessage = "Motor Y movido " + String(cmdValue) + " passos.";
+      break;
+    case 'Z':
+      moveSingleStepper(stepperZ, cmdValue);
+      statusMessage = "Motor Z movido " + String(cmdValue) + " passos.";
+      break;
+    case 'E':
+      moveSingleStepper(stepperA, cmdValue);
+      statusMessage = "Motor E(A) movido " + String(cmdValue) + " passos.";
+      break;
+    case 'S':
+      if (cmdValue >= 0 && cmdValue <= 180) {
+        servo1.write(cmdValue);
+        statusMessage = "Servo 1 movido para " + String(cmdValue) + "°.";
+      } else {
+        statusMessage = "Erro: Ângulo do servo 1 inválido.";
+      }
+      break;
+    case 'A':
+      if (cmdValue >= 0 && cmdValue <= 180) {
+        servo2.write(cmdValue);
+        statusMessage = "Servo 2 movido para " + String(cmdValue) + "°.";
+      } else {
+        statusMessage = "Erro: Ângulo do servo 2 inválido.";
+      }
+      break;
+    case 'C': // Comando especial para cruz
+      fazerCruz();
+      return;
+    case 'T': // Comando de teste
+      statusMessage = "Teste OK - Sistema funcionando!";
+      break;
+    default:
+      statusMessage = "Erro: Comando '" + String(cmdType) + "' desconhecido.";
+      break;
+  }
+  
+  Serial.println(statusMessage);
+  sendUDPResponse(statusMessage);
+}
+
+// ================== ENVIO RESPOSTA UDP ==================
+void sendUDPResponse(String message) {
+  if (udp.beginPacket(udp.remoteIP(), udp.remotePort())) {
+    udp.write(message.c_str());
+    if (udp.endPacket()) {
+      Serial.println("Resposta enviada: " + message);
+    }
+  }
+}
+
+// ================== EXECUTAR MOVIMENTO COORDENADO ==================
+void executarMovimentoCoordenado(long Vx, long Dx, long Vy, long Dy, long Va, long Da, long Vz, long Dz) {
+  Serial.println("=== INICIANDO MOVIMENTO COORDENADO ===");
+  
+  // Agora os 4 motores rodam SIMULTANEAMENTE!
+  // X e A = movimento vertical (espelhados)
+  // Y e Z = movimento horizontal (espelhados)
+  
+  moverMotoresSimultaneos(Dx, Da, Dy, Dz, Vx, Va, Vy, Vz);
+
+  statusMessage = "Movimento concluído! " +
+                 String("X(V=") + Vx + " D=" + Dx + ") " +
+                 "A(V=" + Va + " D=" + Da + ") " +
+                 "Y(V=" + Vy + " D=" + Dy + ") " +
+                 "Z(V=" + Vz + " D=" + Dz + ")";
+  Serial.println(statusMessage);
+  sendUDPResponse(statusMessage);
+}
+
+// ================== LOOP PRINCIPAL ==================
+void loop() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    int len = udp.read(incomingPacket, sizeof(incomingPacket) - 1);
+    if (len > 0) {
+      incomingPacket[len] = '\0';
+      String command = String(incomingPacket);
+      command.trim();
+      
+      Serial.println("=== COMANDO RECEBIDO ===");
+      Serial.println("Comando: " + command);
+      
+      // Verifica se é comando no formato com tabulação
+      if (command.indexOf('\t') != -1 || (command.indexOf(' ') != -1 && command.length() > 10)) {
+        long Vx, Dx, Vy, Dy, Va, Da, Vz, Dz;
+        
+        if (parseTabDelimitedCommand(command, Vx, Dx, Vy, Dy, Va, Da, Vz, Dz)) {
+          executarMovimentoCoordenado(Vx, Dx, Vy, Dy, Va, Da, Vz, Dz);
+        } else {
+          statusMessage = "ERRO: Formato inválido! Use: Vx Dx Vy Dy Va Da Vz Dz";
+          sendUDPResponse(statusMessage);
+        }
+      } else {
+        // Comando simples
+        parseAndExecuteCommand(command);
+      }
+    }
+  }
+  
+  delay(10);
+}
